@@ -918,6 +918,7 @@ def report(cfg, res):
         {"item": "目前資產", "value": "、".join(f"{a['symbol']} {fmt(a['value'])} 元" for a in cfg["assets"] if a.get("value"))}]
     L += [f"| {p['item']} | {p['value']} |" for p in profile]
     has_inc = any(cfg.get(k) for k in ("labor_insurance", "labor_pension", "other_income"))
+    early_last = max(x["age"] for x in res["_calc"]["early_rows"] if "success_plan" in x)
     save = lambda x: ("已經退休，沒辦法再存，只能減少生活費或調整配置" if x is None
                       else "不用多存" if x <= 0 else f"每月多存 **{fmt(x)} 元**")
     L += ["",
@@ -935,15 +936,15 @@ def report(cfg, res):
          f"{e['plan_end_age']} 歲；如果活到 {e['stress_end_age']} 歲，機率是 {pc(m['success_to_95'])}",
          f"- **錢大約幾歲用完**（理想情況）：" + (f"{d['depletion_age']} 歲" if d["depletion_age"] else f"活到 {e['stress_end_age']} 歲都還有剩"),
          "- **跨越點（被動收入 ≥ 生活費）**：" + (f"{d['crossover_age']} 歲（假設一直工作、持續投入到那時）" if d["crossover_age"]
-                                            else f"{e['stress_end_age']} 歲前不會跨越") + "，詳見「跨越點」一節",
-         "- **最早可以幾歲退休**：" + "；".join(
-             f"{name}：{a} 歲" if a is not None else f"{name}：試算範圍內達不到"
-             for name, a in (("確定性", res["early_retirement"]["earliest_deterministic"]),
-                             (f"{m['target_success'] * 100:.0f}% 機率撐到 {e['plan_end_age']} 歲",
-                              res["early_retirement"]["earliest_mc_plan"]),
-                             (f"{m['target_success'] * 100:.0f}% 機率撐到 {e['stress_end_age']} 歲",
-                              res["early_retirement"]["earliest_mc_stress"])))
-         + "，詳見「什麼時候可以提早退休」",
+                                            else f"{e['stress_end_age']} 歲前不會跨越") + "，詳見「跨越點（財務自由門檻）與提早退休」一節",
+         "- **最早可以幾歲退休**（其他條件不變，退休後就不再存錢）：",
+         *[f"  - {desc}：" + (f"**{a} 歲**就能退休" if a is not None else f"試算到 {early_last} 歲都還做不到")
+           for desc, a in ((f"想有 {m['target_success'] * 100:.0f}% 的把握錢夠用到 {e['plan_end_age']} 歲",
+                            res["early_retirement"]["earliest_mc_plan"]),
+                           (f"想有 {m['target_success'] * 100:.0f}% 的把握活到 {e['stress_end_age']} 歲錢都還夠用",
+                            res["early_retirement"]["earliest_mc_stress"]),
+                           ("理想情況（每年報酬都剛好是平均值）", res["early_retirement"]["earliest_deterministic"]))],
+         "  - 理想情況沒算到市場有漲有跌，不建議照那個年齡退休；各年齡的試算見「什麼時候可以提早退休」",
          "", "> 「理想情況」假設每年報酬都一樣，真實市場不會這麼平順，所以建議以「有把握」那個數字為準。"
          "機率怎麼算出來的，請看下方「蒙地卡羅模擬」一節。", "",
          "## 輸入摘要", "",
