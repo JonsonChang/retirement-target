@@ -1,0 +1,16 @@
+# 機密
+.env
+
+# 個人資料與產出報告
+/個人資料*.txt
+/retirement_input*.json
+/retirement_report_*
+/retirement_summary_*
+*.pdf
+
+# Claude Code 本機設定
+.claude/settings.local.json
+
+# Python
+__pycache__/
+.pytest_cache/
