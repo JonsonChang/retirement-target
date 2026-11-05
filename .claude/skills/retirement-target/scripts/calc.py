@@ -10,6 +10,7 @@
 輸入 JSON 格式見 ../reference/input_schema.md。結果以 JSON 輸出到 stdout。
 """
 import argparse
+import copy
 import json
 import math
 import sys
@@ -213,6 +214,50 @@ def crossover_rows(a0, monthly, r_acc, r_ret, age, ra, end_age, inc, lumps, expe
     return rows
 
 
+def cfg_retire_at(cfg, x):
+    """改成 x 歲退休的輸入：勞保年資依提早／延後的年數增減（未滿 15 年改為一次領），一次領不早於退休。
+    勞退的請領年齡由 labor_pension() 自動取 max(60, 退休年齡, claim_age)。"""
+    c = copy.deepcopy(cfg)
+    c["retire_age"] = x
+    li = c.get("labor_insurance")
+    if li:
+        li["years"] = max(0.0, li["years"] - (cfg["retire_age"] - x))
+        if li["years"] < LI_MIN_ANNUITY_YEARS:
+            li["mode"] = "lump_sum"
+        if li.get("mode") == "lump_sum":
+            li["claim_age"] = max(li["claim_age"], x)
+    return c
+
+
+def early_retire_scan(cfg, mu, cov, w_acc, w_ret, a0, r_acc, r_ret, plan_end, stress_end, z):
+    """提早退休：逐一假設在 age … plan_end−1 歲退休（退休後停止投入），算退休時資產、目標、缺口、
+    退休後每月最多可花多少（確定性、花到規劃終點剛好用完），以及退休年齡在原規劃 +5 年內的蒙地卡羅成功率。
+    z 的期數 = stress_end − age，與退休年齡無關，所以各退休年齡共用同一組亂數。"""
+    age, monthly = cfg["age"], cfg.get("monthly_contribution", 0.0)
+    rows = []
+    for x in range(age, plan_end):
+        c = cfg_retire_at(cfg, x)
+        inc, lumps, *_ = income_by_age(c, plan_end)
+        n_acc = x - age
+        acc = project_rows(a0, monthly, r_acc, age, n_acc)
+        proj = acc[-1]["end"] if acc else a0
+        target = max(0.0, pv_due(needs_vector(c, x, plan_end, inc, lumps), r_ret))
+        lo, hi = 0.0, max(1e6, proj)  # 二分搜尋每月可花：目標現值 ≤ 退休時資產
+        for _ in range(50):
+            mid = (lo + hi) / 2
+            if pv_due(needs_vector({**c, "monthly_expense": mid}, x, plan_end, inc, lumps), r_ret) <= proj:
+                lo = mid
+            else:
+                hi = mid
+        row = {"age": x, "projected": proj, "target": target, "gap": target - proj, "max_monthly": lo}
+        if x <= cfg["retire_age"] + 5:
+            ns = needs_vector(c, x, stress_end, inc, lumps)
+            dep = simulate(mu, cov, w_acc, w_ret, a0, monthly, ns, n_acc, z)[1]
+            row.update(success_plan=success_rate(dep, plan_end - x), success_stress=success_rate(dep, len(ns)))
+        rows.append(row)
+    return rows
+
+
 def depletion_age(a, needs, r, start_age):
     for k, n in enumerate(needs):
         a -= n
@@ -321,6 +366,12 @@ def run(cfg):
     cross = crossover_rows(a0, monthly, r_acc, r_ret, age, ra, stress_end, inc, lumps, 12 * cfg["monthly_expense"])
     cross_age = next((x["age"] for x in cross if x["invest"] + x["fixed"] >= x["expense"]), None)
 
+    early = early_retire_scan(cfg, mu, cov, w_acc, w_ret, a0, r_acc, r_ret, plan_end, stress_end, z)
+    first = lambda ok: next((x["age"] for x in early if ok(x)), None)
+    early_ages = {"deterministic": first(lambda x: x["gap"] <= 0),
+                  "mc_plan": first(lambda x: x.get("success_plan", 0) >= target_sr),
+                  "mc_stress": first(lambda x: x.get("success_stress", 0) >= target_sr)}
+
     dep_ages = ra + dep[(dep >= 0) & (dep < T_plan)]
     pct = lambda x: {f"P{p}": float(np.percentile(x, p)) for p in (10, 50, 90)}
     return {
@@ -339,6 +390,9 @@ def run(cfg):
             "first_year_need": float(needs_plan[0]) if T_plan else 0.0,
             "crossover_age": cross_age,
         },
+        "early_retirement": {"earliest_deterministic": early_ages["deterministic"],
+                             "earliest_mc_plan": early_ages["mc_plan"],
+                             "earliest_mc_stress": early_ages["mc_stress"]},
         "monte_carlo": {
             "paths": paths, "success_plan": sr_plan, "success_to_95": sr_95,
             "prob_reach_target": float(np.mean(a_ret >= target)),
@@ -360,7 +414,7 @@ def run(cfg):
                              "lumps": {k: v.get(ra + t, 0.0) for k, v in lump_parts.items()},
                              "need": float(n), "df": (1 + r_ret) ** t, "pv": float(n) / (1 + r_ret) ** t}
                             for t, n in enumerate(needs_plan)],
-            "acc_rows": acc_rows, "fv_factor": fv_factor, "cross_rows": cross,
+            "acc_rows": acc_rows, "fv_factor": fv_factor, "cross_rows": cross, "early_rows": early,
             "draw_rows": drawdown_rows(projected, needs_stress, r_ret, ra),
             "mc_pcts": [{"age": age + k, "P10": float(p[0]), "P50": float(p[1]), "P90": float(p[2])}
                         for k, p in enumerate(mc_pcts)],
@@ -676,9 +730,11 @@ def crossover_section(cfg, res):
     e, d = res["inputs_echo"], res["deterministic"]
     rows, ca, ra = res["_calc"]["cross_rows"], d["crossover_age"], e["retire_age"]
     exp_m = cfg["monthly_expense"]
+    early = {x["age"]: x for x in res["_calc"]["early_rows"]}
     shown = [x for x in rows if x["age"] <= (min(ca + 3, e["stress_end_age"]) if ca else e["stress_end_age"])]
+    in_plan = [x for x in shown if x["age"] in early]  # 圖表只畫到規劃終點前一年（之後沒有「可花到規劃終點」的值）
     by_age = {x["age"]: x for x in rows}
-    L = ["## 跨越點（財務自由門檻）", "",
+    L = ["## 跨越點（財務自由門檻）與提早退休", "",
          "跨越點法則（Crossover Point）：**每月的被動收入 ≥ 每月生活支出**，"
          "就跨過財務自由的門檻，不必再靠工作收入。", "",
          "- **被動收入** = 投資資產 × 實質預期報酬 ÷ 12，加上已開始請領的勞保等固定月收入",
@@ -686,9 +742,15 @@ def crossover_section(cfg, res):
          f"- 假設一直工作到該年齡、每月持續投入 {fmt(cfg.get('monthly_contribution', 0))} 元、不提領；"
          f"{ra} 歲前用目前配置的報酬 {pc2(res['returns']['accumulation_real'])}，"
          f"{ra} 歲起用退休配置的報酬 {pc2(res['returns']['retirement_real'])}；勞保、勞退依原規劃的請領年齡計入",
-         f"- 生活支出 = 退休後每月生活費 {fmt(exp_m)} 元（今天的物價）", "",
-         *chart("跨越點：每月被動收入（長條）vs 每月生活費（線）（萬元／月）", [x["age"] for x in shown],
-                [("bar", [(x["invest"] + x["fixed"]) / 12 for x in shown]), ("line", [x["expense"] / 12 for x in shown])],
+         f"- 生活支出 = 退休後每月生活費 {fmt(exp_m)} 元（今天的物價）",
+         f"- **綠線（該年齡退休每月可花）**：如果在這個年齡退休、停止投入，退休後每月最多能花多少，"
+         f"才能剛好花到規劃終點 {e['plan_end_age']} 歲（會動用本金；確定性計算）。"
+         "綠線越過橘線的年齡，就是最早可以退休的年齡（見下方「什麼時候可以提早退休」）", "",
+         *chart("跨越點與提早退休：被動收入（藍柱）、生活費（橘線）、該年齡退休每月可花（綠線）（萬元／月）",
+                [x["age"] for x in in_plan],
+                [("bar", [(x["invest"] + x["fixed"]) / 12 for x in in_plan]),
+                 ("line", [x["expense"] / 12 for x in in_plan]),
+                 ("line", [early[x["age"]]["max_monthly"] for x in in_plan])],
                 unit="萬元／月"),
          "| 年齡 | 年初投資資產 | 每月投資收益 | 每月固定收入 | 每月被動收入合計 | 佔生活費 |", "|--:|--:|--:|--:|--:|--:|"]
     for x in shown:
@@ -711,6 +773,36 @@ def crossover_section(cfg, res):
     L += ["- **跟「退休金目標」的差別**：退休金目標允許退休後逐年花掉本金，算到規劃終點 "
           f"{e['plan_end_age']} 歲剛好用完；跨越點只花收益、不動本金，資產可以永續，所以門檻高得多、時間也晚得多",
           "- 介於兩者之間的做法：先到退休金目標就退休，但保留彈性（熊市少花、兼職收入），越接近跨越點越安全", ""]
+    return L + early_retire_section(cfg, res)
+
+
+def early_retire_section(cfg, res):
+    """「什麼時候可以提早退休」：逐一假設各退休年齡，看缺口與蒙地卡羅成功率。"""
+    e, m, er = res["inputs_echo"], res["monte_carlo"], res["early_retirement"]
+    ra, end, stress, ts = e["retire_age"], e["plan_end_age"], e["stress_end_age"], m["target_success"]
+    rows = [x for x in res["_calc"]["early_rows"] if "success_plan" in x]
+    age_txt = lambda a: f"**{a} 歲**" if a is not None else f"{rows[-1]['age']} 歲前都達不到"
+    L = ["### 什麼時候可以提早退休", "",
+         f"把退休年齡從現在的 {e['age']} 歲逐年往後試算到 {rows[-1]['age']} 歲（其他條件不變），看哪一年退休就夠用：", "",
+         f"- 退休後停止每月投入 {fmt(cfg.get('monthly_contribution', 0))} 元；投資資產只靠報酬成長",
+         "- 勞保年資依提早／延後的年數增減（離職後不再累積），未滿 15 年改為一次領；勞保請領年齡不變",
+         f"- 勞退專戶在退休後不再有雇主提繳，最早 {LP_MIN_CLAIM_AGE} 歲才能領；退休到那之前完全靠投資組合支應",
+         f"- 規劃終點固定為 {end} 歲，提早退休 = 退休期更長", "",
+         "| 標準 | 最早退休年齡 |", "|---|--:|",
+         f"| 確定性：退休時資產 ≥ 退休金目標（花到 {end} 歲） | {age_txt(er['earliest_deterministic'])} |",
+         f"| 蒙地卡羅：{pc(ts)} 機率撐到 {end} 歲（規劃終點） | {age_txt(er['earliest_mc_plan'])} |",
+         f"| 蒙地卡羅：{pc(ts)} 機率撐到 {stress} 歲 | {age_txt(er['earliest_mc_stress'])} |", "",
+         f"| 退休年齡 | 退休時資產 | 退休金目標 | 缺口（負＝有餘裕） | 每月最多可花 | 撐到 {end} 歲成功率 | 撐到 {stress} 歲成功率 |",
+         "|--:|--:|--:|--:|--:|--:|--:|"]
+    for x in rows:
+        mark = "（原規劃）" if x["age"] == ra else ""
+        L.append(f"| {x['age']}{mark} | {fmt(x['projected'])} | {fmt(x['target'])} | {fmt(x['gap'])} | "
+                 f"{fmt(x['max_monthly'])} | {pc(x['success_plan'])} | {pc(x['success_stress'])} |")
+    L += ["",
+          "- **缺口剛轉負不代表安全**：確定性計算假設每年都拿到平均報酬，沒有考慮市場波動與報酬順序風險，"
+          "所以蒙地卡羅的最早退休年齡通常會晚幾年",
+          f"- 建議以「{pc(ts)} 機率撐到 {end} 歲」為最低標準；擔心長壽就看「撐到 {stress} 歲」那一列",
+          "- 未計入：離職後自繳的健保、國民年金保費；提早退休前可能的兼職收入", ""]
     return L
 
 
@@ -844,6 +936,14 @@ def report(cfg, res):
          f"- **錢大約幾歲用完**（理想情況）：" + (f"{d['depletion_age']} 歲" if d["depletion_age"] else f"活到 {e['stress_end_age']} 歲都還有剩"),
          "- **跨越點（被動收入 ≥ 生活費）**：" + (f"{d['crossover_age']} 歲（假設一直工作、持續投入到那時）" if d["crossover_age"]
                                             else f"{e['stress_end_age']} 歲前不會跨越") + "，詳見「跨越點」一節",
+         "- **最早可以幾歲退休**：" + "；".join(
+             f"{name}：{a} 歲" if a is not None else f"{name}：試算範圍內達不到"
+             for name, a in (("確定性", res["early_retirement"]["earliest_deterministic"]),
+                             (f"{m['target_success'] * 100:.0f}% 機率撐到 {e['plan_end_age']} 歲",
+                              res["early_retirement"]["earliest_mc_plan"]),
+                             (f"{m['target_success'] * 100:.0f}% 機率撐到 {e['stress_end_age']} 歲",
+                              res["early_retirement"]["earliest_mc_stress"])))
+         + "，詳見「什麼時候可以提早退休」",
          "", "> 「理想情況」假設每年報酬都一樣，真實市場不會這麼平順，所以建議以「有把握」那個數字為準。"
          "機率怎麼算出來的，請看下方「蒙地卡羅模擬」一節。", "",
          "## 輸入摘要", "",
