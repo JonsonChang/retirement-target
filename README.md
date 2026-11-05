@@ -20,6 +20,14 @@ Claude Code skill：計算退休金目標、退休缺口與每月需再多存多
 
 ![錢能撐到幾歲](docs/images/survival.png)
 
+**每年提領金額**：退休後每年要從投資組合提領多少，以及折算成今天的現值（65 歲起勞保年金開始給付，提領金額隨之下降）
+
+![每年提領](docs/images/withdrawal.png)
+
+**各資產實質報酬**：股票用高登方程式、債券與現金用目前殖利率，換算扣除通膨後的實質報酬
+
+![各資產實質報酬](docs/images/asset-returns.png)
+
 ## 安裝
 
 1. 將本 repo clone 下來，在 repo 根目錄啟動 Claude Code（skill 位於 `.claude/skills/retirement-target`）。
