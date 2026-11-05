@@ -201,6 +201,18 @@ def drawdown_rows(a, needs, r, start_age):
     return rows
 
 
+def crossover_rows(a0, monthly, r_acc, r_ret, age, ra, end_age, inc, lumps, expense):
+    """跨越點：假設持續工作、每月投入、不提領，逐年比較年初的被動收入
+    （投資資產 × 實質報酬 + 勞保等固定收入）與年生活費。一次領的金額在請領當年年初存入。"""
+    rows, a = [], a0
+    for x in range(age, end_age + 1):
+        a += lumps.get(x, 0.0)
+        r = r_acc if x < ra else r_ret
+        rows.append({"age": x, "assets": a, "rate": r, "invest": a * r, "fixed": inc.get(x, 0.0), "expense": expense})
+        a = a * (1 + r) + 12 * monthly
+    return rows
+
+
 def depletion_age(a, needs, r, start_age):
     for k, n in enumerate(needs):
         a -= n
@@ -306,6 +318,9 @@ def run(cfg):
                     lo = mid
             extra_mc = hi - monthly
 
+    cross = crossover_rows(a0, monthly, r_acc, r_ret, age, ra, stress_end, inc, lumps, 12 * cfg["monthly_expense"])
+    cross_age = next((x["age"] for x in cross if x["invest"] + x["fixed"] >= x["expense"]), None)
+
     dep_ages = ra + dep[(dep >= 0) & (dep < T_plan)]
     pct = lambda x: {f"P{p}": float(np.percentile(x, p)) for p in (10, 50, 90)}
     return {
@@ -322,6 +337,7 @@ def run(cfg):
             "extra_monthly_needed": extra_det,
             "depletion_age": depletion_age(projected, needs_stress, r_ret, ra),
             "first_year_need": float(needs_plan[0]) if T_plan else 0.0,
+            "crossover_age": cross_age,
         },
         "monte_carlo": {
             "paths": paths, "success_plan": sr_plan, "success_to_95": sr_95,
@@ -344,7 +360,7 @@ def run(cfg):
                              "lumps": {k: v.get(ra + t, 0.0) for k, v in lump_parts.items()},
                              "need": float(n), "df": (1 + r_ret) ** t, "pv": float(n) / (1 + r_ret) ** t}
                             for t, n in enumerate(needs_plan)],
-            "acc_rows": acc_rows, "fv_factor": fv_factor,
+            "acc_rows": acc_rows, "fv_factor": fv_factor, "cross_rows": cross,
             "draw_rows": drawdown_rows(projected, needs_stress, r_ret, ra),
             "mc_pcts": [{"age": age + k, "P10": float(p[0]), "P50": float(p[1]), "P90": float(p[2])}
                         for k, p in enumerate(mc_pcts)],
@@ -396,12 +412,18 @@ def pc2(x):
     return f"{x * 100:.2f}%"
 
 
-def chart(title, xs, series, unit="萬元", scale=1e4):
-    """Mermaid xychart；series 為 [("bar"|"line", 數值清單)]，數值 ÷ scale 後以 unit 顯示。"""
+CHART_PALETTE = ["#4E79A7", "#F28E2B", "#59A14F"]  # Mermaid 預設的第一色太淡，改用對比明顯的顏色
+
+
+def chart(title, xs, series, unit="萬元", scale=1e4, palette=None):
+    """Mermaid xychart；series 為 [("bar"|"line", 數值清單)]，數值 ÷ scale 後以 unit 顯示。
+    palette 為依序對應各 series 的顏色清單，省略時用 CHART_PALETTE。"""
     if len(xs) < 2:
         return []
-    L = ["```mermaid", "xychart-beta", f'    title "{title}"', f"    x-axis [{', '.join(str(x) for x in xs)}]",
-         f'    y-axis "{unit}"']
+    L = ["```mermaid",
+         '%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "' + ", ".join(palette or CHART_PALETTE) + '"}}}}%%',
+         "xychart-beta", f'    title "{title}"', f"    x-axis [{', '.join(str(x) for x in xs)}]",
+          f'    y-axis "{unit}"']
     for kind, vals in series:
         L.append(f"    {kind} [{', '.join(f'{v / scale:.1f}' for v in vals)}]")
     return L + ["```", ""]
@@ -523,10 +545,26 @@ def calc_sections(cfg, res):
     L += [f"| **合計** | | | " + "| " * len(cols) + f"{fmt(sum(x['need'] for x in rows))} | | **{fmt(c['target_raw'])}** |", ""]
     if c["target_raw"] < 0:
         L += [f"- 現值合計為負，代表固定收入與一次領已足夠支應，目標取 max(0, 合計) = **0**", ""]
-    L += ["年生活費（折線）與月領收入合計（長條）：", "",
-          *chart("年生活費 vs 月領收入（萬元）", [x["age"] for x in rows],
-                 [("bar", [sum(x["parts"].values()) for x in rows]), ("line", [x["expense"] for x in rows])]),
-          "每年須由投資組合提領 $C_t$（長條）與其折現值（折線）：", "",
+    # 年生活費拆成「固定收入」與「投資組合提領」：兩組長條重疊繪製，整根 = 年生活費，下段 = 固定收入，上段 = 缺口
+    fixed = [min(x["expense"], sum(x["parts"].values())) for x in rows]
+    segs = []  # 固定收入相同的連續年齡合併成一段
+    for x, f in zip(rows, fixed):
+        if segs and abs(segs[-1][2] - f) < 0.5:
+            segs[-1][1] = x["age"]
+        else:
+            segs.append([x["age"], x["age"], f, x["expense"]])
+    L += ["年生活費由誰支付：整根長條 = 年生活費，底部藍色 = **勞保、勞退等固定收入**，"
+          "上方橘色 = **缺口，須由投資組合提領**：", "",
+          *chart("年生活費 = 固定收入（下段）+ 投資組合提領（上段）（萬元）", [x["age"] for x in rows],
+                 [("bar", [x["expense"] for x in rows]), ("bar", fixed)], palette=["#F28E2B", "#4E79A7"]),
+          "| 年齡 | 年生活費 | 固定收入 | 投資組合提領（缺口） | 缺口佔生活費 |", "|---|--:|--:|--:|--:|"]
+    L += [f"| {a}{'' if a == b else f'～{b}'} | {fmt(ex)} | {fmt(f)} | {fmt(ex - f)} | {pc((ex - f) / ex if ex else 0)} |"
+          for a, b, f, ex in segs]
+    lump_total = sum(sum(x["lumps"].values()) for x in rows)
+    if lump_total:
+        L += ["", f"- 一次領合計 {fmt(lump_total)} 元在請領當年存入投資組合，不算固定收入；"
+              f"它可支付約 {lump_total / max(1.0, segs[0][3] - segs[0][2]):.1f} 年的退休初期缺口"]
+    L += ["", "每年須由投資組合提領 $C_t$（長條，已扣除一次領存入）與其折現值（折線）：", "",
           *chart("每年提領 C_t 與現值（萬元）", [x["age"] for x in rows],
                  [("bar", [x["need"] for x in rows]), ("line", [x["pv"] for x in rows])]),
           f"- 不計勞保、勞退等固定收入時，每年都要提領 {fmt(12 * cfg['monthly_expense'])}，"
@@ -630,6 +668,49 @@ def portfolio_section(cfg, res):
     for k, v in lumps:
         L.append(f"- **{names[k]}一次領**：{v['claim_age']} 歲領到 {fmt(v['lump'])} 元，當年存入投資組合，同樣依退休配置投資")
     L.append("")
+    return L
+
+
+def crossover_section(cfg, res):
+    """報告中「跨越點」：被動收入什麼時候超過生活費（財務自由門檻）。"""
+    e, d = res["inputs_echo"], res["deterministic"]
+    rows, ca, ra = res["_calc"]["cross_rows"], d["crossover_age"], e["retire_age"]
+    exp_m = cfg["monthly_expense"]
+    shown = [x for x in rows if x["age"] <= (min(ca + 3, e["stress_end_age"]) if ca else e["stress_end_age"])]
+    by_age = {x["age"]: x for x in rows}
+    L = ["## 跨越點（財務自由門檻）", "",
+         "跨越點法則（Crossover Point）：**每月的被動收入 ≥ 每月生活支出**，"
+         "就跨過財務自由的門檻，不必再靠工作收入。", "",
+         "- **被動收入** = 投資資產 × 實質預期報酬 ÷ 12，加上已開始請領的勞保等固定月收入",
+         "- 用**實質**報酬（已扣通膨）計算：只花掉這部分，本金的購買力不會縮水，可以一直花下去",
+         f"- 假設一直工作到該年齡、每月持續投入 {fmt(cfg.get('monthly_contribution', 0))} 元、不提領；"
+         f"{ra} 歲前用目前配置的報酬 {pc2(res['returns']['accumulation_real'])}，"
+         f"{ra} 歲起用退休配置的報酬 {pc2(res['returns']['retirement_real'])}；勞保、勞退依原規劃的請領年齡計入",
+         f"- 生活支出 = 退休後每月生活費 {fmt(exp_m)} 元（今天的物價）", "",
+         *chart("跨越點：每月被動收入（長條）vs 每月生活費（線）（萬元／月）", [x["age"] for x in shown],
+                [("bar", [(x["invest"] + x["fixed"]) / 12 for x in shown]), ("line", [x["expense"] / 12 for x in shown])],
+                unit="萬元／月"),
+         "| 年齡 | 年初投資資產 | 每月投資收益 | 每月固定收入 | 每月被動收入合計 | 佔生活費 |", "|--:|--:|--:|--:|--:|--:|"]
+    for x in shown:
+        if (x["age"] - e["age"]) % 5 == 0 or x["age"] in (ra, ca, shown[-1]["age"]):
+            tot = (x["invest"] + x["fixed"]) / 12
+            mark = "（預計退休）" if x["age"] == ra else "（跨越點）" if x["age"] == ca else ""
+            L.append(f"| {x['age']}{mark} | {fmt(x['assets'])} | {fmt(x['invest'] / 12)} | {fmt(x['fixed'] / 12)} | "
+                     f"{fmt(tot)} | {pc(tot / exp_m)} |")
+    r = by_age.get(ra)
+    L += [""]
+    if ca:
+        L.append(f"- **跨越點在 {ca} 歲**：從這一年起，只靠投資收益與固定收入就付得起每月 {fmt(exp_m)} 元的生活費")
+    else:
+        L.append(f"- 到 {e['stress_end_age']} 歲前都**不會**跨越：被動收入始終低於每月 {fmt(exp_m)} 元")
+    if r:
+        need = max(0.0, r["expense"] - r["fixed"]) / r["rate"] if r["rate"] > 0 else None
+        L.append(f"- 預計 {ra} 歲退休時，被動收入約每月 {fmt((r['invest'] + r['fixed']) / 12)} 元，"
+                 f"只佔生活費 {pc((r['invest'] + r['fixed']) / r['expense'])}；要在 {ra} 歲就跨越，"
+                 f"投資資產需達 {fmt(need)} 元（年生活費扣掉固定收入 ÷ 實質報酬）")
+    L += ["- **跟「退休金目標」的差別**：退休金目標允許退休後逐年花掉本金，算到規劃終點 "
+          f"{e['plan_end_age']} 歲剛好用完；跨越點只花收益、不動本金，資產可以永續，所以門檻高得多、時間也晚得多",
+          "- 介於兩者之間的做法：先到退休金目標就退休，但保留彈性（熊市少花、兼職收入），越接近跨越點越安全", ""]
     return L
 
 
@@ -761,6 +842,8 @@ def report(cfg, res):
          f"- **錢夠用的機率**：電腦模擬 {m['paths']:,} 種未來的市場走勢，其中 **{pc(m['success_plan'])}** 的情況錢能撐到 "
          f"{e['plan_end_age']} 歲；如果活到 {e['stress_end_age']} 歲，機率是 {pc(m['success_to_95'])}",
          f"- **錢大約幾歲用完**（理想情況）：" + (f"{d['depletion_age']} 歲" if d["depletion_age"] else f"活到 {e['stress_end_age']} 歲都還有剩"),
+         "- **跨越點（被動收入 ≥ 生活費）**：" + (f"{d['crossover_age']} 歲（假設一直工作、持續投入到那時）" if d["crossover_age"]
+                                            else f"{e['stress_end_age']} 歲前不會跨越") + "，詳見「跨越點」一節",
          "", "> 「理想情況」假設每年報酬都一樣，真實市場不會這麼平順，所以建議以「有把握」那個數字為準。"
          "機率怎麼算出來的，請看下方「蒙地卡羅模擬」一節。", "",
          "## 輸入摘要", "",
@@ -774,7 +857,7 @@ def report(cfg, res):
         c = cls[a["symbol"]]
         L.append(f"| {a['symbol']} | {c.get('asset_class', '')} | {fmt(c.get('value', 0))} | {pc(a['weight_now'])} | "
                  f"{pc(a['weight_retire'])} | {pc(a['real_geometric'])} | {pc(a['vol'])} |")
-    L += [""] + portfolio_section(cfg, res) + calc_sections(cfg, res) + mc_section(res)
+    L += [""] + portfolio_section(cfg, res) + crossover_section(cfg, res) + calc_sections(cfg, res) + mc_section(res)
     L += ["## 資料來源", "", "| 項目 | 數值 | 來源 |", "|---|---|---|"]
     for s in cfg.get("sources", []):
         L.append(f"| {s['item']} | {s['value']} | {s['source']} |")
