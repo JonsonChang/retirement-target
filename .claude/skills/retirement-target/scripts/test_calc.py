@@ -155,3 +155,86 @@ def test_report_retirement_portfolio():
     assert "## 退休後的投資組合" in rep
     assert "| 股票 | 100.0% | 40.0% |" in rep and "| 債券 | 0.0% | 60.0% |" in rep
     assert "為什麼退休要換配置" in rep
+
+
+def test_four_pct_rule_without_income():
+    res = calc.run(base_cfg())
+    f = res["four_percent_rule"]
+    assert f["target"] == pytest.approx(25 * 12 * 50000) and f["bridge"] == 0
+
+
+def test_four_pct_rule_with_bridge():
+    # 60 歲退休、65 歲起勞保月領：門檻 = 25 × (年生活費 − 勞保) + 60～64 歲每年的勞保金額
+    li = {"avg_insured_salary": 45800, "years": 30, "claim_age": 65, "legal_age": 65}
+    res = calc.run(base_cfg(labor_insurance=li))
+    li_year = 12 * calc.labor_insurance_detail(li)["monthly"]
+    f = res["four_percent_rule"]
+    assert f["annual_gap"] == pytest.approx(12 * 50000 - li_year)
+    assert f["bridge"] == pytest.approx(5 * li_year)
+    assert f["target"] == pytest.approx(25 * (12 * 50000 - li_year) + 5 * li_year)
+
+
+def test_liability_matching():
+    cfg = base_cfg(
+        assets=[{"symbol": "EQ", "asset_class": "us_large_cap", "value": 1_000_000, "expected_return": 0.07, "vol": 0.18},
+                {"symbol": "BD", "asset_class": "us_aggregate_bond", "value": 0, "expected_return": 0.04, "vol": 0.06}],
+        retirement_allocation={"EQ": 0.4, "BD": 0.6})
+    res = calc.run(cfg)
+    lm, A = res["_calc"]["lmp"], res["deterministic"]["projected_at_retirement"]
+    assert lm["rows"][0]["lmp"] == pytest.approx(5 * 12 * 50000)
+    assert lm["rows"][0]["risk"] == pytest.approx(A - 5 * 12 * 50000)
+    rep = calc.report(cfg, res)
+    assert "25 倍法則（4% 法則）" in rep and "負債配合投資組合" in rep
+    assert "風險池**照你的退休配置**持有並每年再平衡：EQ 40.0%、BD 60.0%" in rep
+
+
+def test_two_pool_zero_return():
+    # 零報酬零波動：兩池總額只減不增，撐過 n 年 ⇔ 起始資產 ≥ 前 n 年缺口加總；一次領（負數）存入安全池
+    mu, cov = np.zeros(2), np.zeros((2, 2))
+    w, w_safe = np.array([0.5, 0.5]), np.array([0.0, 1.0])
+    needs = np.array([100.0, 100.0, -50.0, 100.0, 100.0])
+    z = np.zeros((2, len(needs), 2))
+    dep = calc.simulate_two_pool(mu, cov, w, w_safe, np.array([350.0, 349.0]), needs, z, 2)
+    assert dep[0] == -1 and dep[1] == 4
+
+
+def test_two_pool_independent_pools():
+    # 安全池只放現金（實質 0），風險池照退休配置 EQ/BD 各半：EQ 每年 +10%、BD 0
+    mu, cov = np.log(np.array([1.1, 1.0, 1.0])), np.zeros((3, 3))
+    w_ret, w_safe = np.array([0.5, 0.5, 0.0]), np.array([0.0, 0.0, 1.0])
+    needs = np.array([100.0, 100.0])
+    z = np.zeros((1, 2, 3))
+    # 起始 195：安全池 100 付第 1 年；風險池 95 照 50/50 成長 5% → 99.75 < 100，第 2 年耗盡
+    # （若風險池只放股票會成長到 104.5 而撐過，可分辨風險池有照退休配置）
+    assert calc.simulate_two_pool(mu, cov, w_ret, w_safe, np.array([195.0]), needs, z, 1)[0] == 1
+    # 起始 196：風險池 96 → 100.8，撐過；沒有現金標的（None）時安全池視為實質 0，結果相同
+    assert calc.simulate_two_pool(mu, cov, w_ret, None, np.array([196.0]), needs, z, 1)[0] == -1
+
+
+def test_two_pool_in_report():
+    cfg = base_cfg(
+        assets=[{"symbol": "EQ", "asset_class": "us_large_cap", "value": 1_000_000, "expected_return": 0.07, "vol": 0.18},
+                {"symbol": "BD", "asset_class": "us_aggregate_bond", "value": 0, "expected_return": 0.04, "vol": 0.06}],
+        retirement_allocation={"EQ": 0.4, "BD": 0.6})
+    res = calc.run(cfg)
+    tp = res["two_pool_mc"]
+    assert tp[0]["strategy"] == "rebalance" and len(tp) == 5
+    assert tp[0]["success_plan"] == pytest.approx(res["monte_carlo"]["success_plan"])
+    assert "### 蒙地卡羅：兩個池子分開運作" in calc.report(cfg, res)
+    pr = res["_calc"]["pool_rows"]
+    assert pr[0]["safe_init"] is None and pr[0]["stock_init"] == pytest.approx(0.4)
+    assert pr[1]["stock_init"] == pytest.approx(0.4 * (1 - pr[1]["safe_init"]))
+
+
+def test_two_pool_target_ignores_lump():
+    # 安全池目標應以「未扣一次領」的缺口計算；一次領另外存入安全池，不能讓 N 年安全池少放一年
+    # 風險池每年 −50%、安全池實質 0；第 1 年缺口 100 但有一次領 50 → needs[0] = 50
+    mu, cov = np.log(np.array([0.5, 1.0])), np.zeros((2, 2))
+    w_ret, w_safe = np.array([1.0, 0.0]), np.array([0.0, 1.0])
+    needs, gap = np.array([50.0, 100.0, 100.0]), np.array([100.0, 100.0, 100.0])
+    z = np.zeros((1, 3, 2))
+    # 目標 = gap 前 2 年 200：安全池 200、風險池 200 → 撐過
+    assert calc.simulate_two_pool(mu, cov, w_ret, w_safe, np.array([400.0]), needs, z, 2, gap)[0] == -1
+    # 舊算法（目標用扣掉一次領的 needs，只有 150）→ 第 3 年耗盡
+    assert calc.simulate_two_pool(mu, cov, w_ret, w_safe, np.array([400.0]), needs, z, 2)[0] == 2
+

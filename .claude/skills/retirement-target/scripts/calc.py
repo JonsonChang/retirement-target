@@ -214,6 +214,35 @@ def crossover_rows(a0, monthly, r_acc, r_ret, age, ra, end_age, inc, lumps, expe
     return rows
 
 
+def four_pct_rule(cfg, inc, ra, end_age, cross, projected, lumps):
+    """4% 法則（William Bengen）：目標 = 25 × (年生活費 − 年固定收入)。
+    固定收入用所有月領收入都開始請領後的金額；請領前的過渡期缺口另外加上（實質、不折現）。
+    reach_age：假設持續工作與投入，年初投資資產第一次 ≥ 「該年齡退休」門檻的年齡。"""
+    exp = 12 * cfg["monthly_expense"]
+    full_age = max([ra] + [a for a in inc if inc[a] > 0 and a < end_age and inc.get(a - 1, 0.0) < inc[a]])
+    fixed = inc.get(full_age, 0.0)
+    gap = max(0.0, exp - fixed)
+
+    def bridge(x):
+        return sum(max(0.0, exp - inc.get(a, 0.0)) - gap for a in range(x, full_age))
+
+    reach = next((r["age"] for r in cross if r["age"] < end_age and r["assets"] >= 25 * gap + bridge(r["age"])), None)
+    return {"annual_expense": exp, "fixed_income": fixed, "full_income_age": full_age, "annual_gap": gap,
+            "base": 25 * gap, "bridge": bridge(ra), "target": 25 * gap + bridge(ra),
+            "projected": projected, "lumps": sum(lumps.values()), "reach_age": reach,
+            "reach_target": 25 * gap + bridge(reach) if reach is not None else None}
+
+
+def liability_matching(needs, a_ret, years=(5, 10, 20, 25)):
+    """負債配合投資組合：退休後前 N 年的提領缺口放獨立的安全池（定存／現金，不折現，假設實質報酬約 0），
+    其餘為風險組合，風險組合照退休配置持有。"""
+    rows = []
+    for n in years:
+        lmp = float(sum(max(0.0, x) for x in needs[:n]))
+        rows.append({"years": n, "lmp": lmp, "share": lmp / a_ret if a_ret > 0 else None, "risk": a_ret - lmp})
+    return {"rows": rows}
+
+
 def cfg_retire_at(cfg, x):
     """改成 x 歲退休的輸入：勞保年資依提早／延後的年數增減（未滿 15 年改為一次領），一次領不早於退休。
     勞退的請領年齡由 labor_pension() 自動取 max(60, 退休年齡, claim_age)。"""
@@ -296,6 +325,37 @@ def simulate(mu, cov, w_acc, w_ret, a0, monthly, needs, n_acc, z, track=False):
     return a_ret, dep, pcts, g_ret
 
 
+def simulate_two_pool(mu, cov, w_ret, w_safe, a_ret, needs, z_ret, n_years, gap=None):
+    """退休後兩個池子分開運作（水桶策略）。退休時把前 n_years 年的提領缺口放獨立的安全池（權重 w_safe，
+    通常是定存／現金；None 或全 0 表示實質報酬 0），其餘放風險池，風險池照退休配置 w_ret 每年再平衡。每年年初：
+    1. 前一年風險池上漲時，賣風險池把安全池補到「未來 n_years 年的缺口」；下跌時不賣
+    2. 生活費從安全池付（一次領的金額存入安全池）；安全池不夠才賣風險池
+    3. 兩池各自成長
+    gap 為未扣一次領的每年缺口，用來算安全池目標（省略時用 needs）；一次領照 needs 存入安全池。
+    回傳耗盡的期數（未耗盡為 -1）。"""
+    k = len(mu)
+    L = np.linalg.cholesky(cov + np.eye(k) * 1e-12)
+    gross = np.exp(mu + z_ret @ L.T)
+    g_safe = gross @ (w_safe / w_safe.sum()) if w_safe is not None and w_safe.sum() > 0 else np.ones(gross.shape[:2])
+    g_risk = gross @ w_ret
+    pos = np.maximum(needs if gap is None else gap, 0.0)
+    tgt = [float(pos[t:t + n_years].sum()) for t in range(len(needs))]
+    safe = np.minimum(a_ret, tgt[0] if tgt else 0.0)
+    risk = a_ret - safe
+    dep = np.full(len(a_ret), -1)
+    for t, n in enumerate(needs):
+        if t > 0:
+            move = np.where(g_risk[:, t - 1] > 1, np.minimum(np.maximum(tgt[t] - safe, 0.0), risk), 0.0)
+            safe, risk = safe + move, risk - move
+        safe = safe - n
+        risk = risk - np.maximum(-safe, 0.0)
+        safe = np.maximum(safe, 0.0)
+        dep[(risk < 0) & (dep < 0)] = t
+        risk = np.maximum(risk, 0.0)
+        safe, risk = safe * g_safe[:, t], risk * g_risk[:, t]
+    return dep
+
+
 def success_rate(dep, horizon):
     return float(np.mean((dep < 0) | (dep >= horizon)))
 
@@ -365,6 +425,28 @@ def run(cfg):
 
     cross = crossover_rows(a0, monthly, r_acc, r_ret, age, ra, stress_end, inc, lumps, 12 * cfg["monthly_expense"])
     cross_age = next((x["age"] for x in cross if x["invest"] + x["fixed"] >= x["expense"]), None)
+    fpr = four_pct_rule(cfg, inc, ra, plan_end, cross, projected, lumps)
+    cls = {a["symbol"]: a.get("asset_class", "") for a in cfg["assets"]}
+    gap_stress = needs_vector(cfg, ra, stress_end, inc)  # 未扣一次領：安全池目標用
+    lmp = liability_matching(gap_stress, projected)
+    # 兩池分開運作 vs 每年再平衡：同一組亂數；最差 25% = 退休後前 5 年年化報酬（再平衡組合）最低的四分之一
+    n_seq = min(5, g_ret.shape[1])
+    worst = (np.log(g_ret[:, :n_seq]).mean(axis=1) <= np.percentile(np.log(g_ret[:, :n_seq]).mean(axis=1), 25)
+             if n_seq else np.ones(paths, bool))
+    # 安全池獨立持有定存／現金（tw_cash）；沒有現金標的時視為實質報酬 0
+    w_safe = np.array([1.0 if asset_group(cls.get(s, "")) == "現金" else 0.0 for s in syms])
+    stock_w = float(sum(w for s, w in zip(syms, w_ret) if asset_group(cls.get(s, "")) == "股票"))
+    pool_rows = [{"years": None, "dep": dep}] + [
+        {"years": n, "dep": simulate_two_pool(mu, cov, w_ret, w_safe, a_ret, needs_stress, z[:, n_acc:, :], n, gap_stress)}
+        for n in (5, 10, 20, 25)]
+    pos_needs = np.maximum(gap_stress, 0.0)
+    for x in pool_rows:
+        dp = x.pop("dep")
+        si = (None if x["years"] is None
+              else min(1.0, float(pos_needs[:x["years"]].sum()) / projected) if projected > 0 else None)
+        x.update(safe_init=si, stock_init=stock_w * (1 - (si or 0.0)),
+                 success_plan=success_rate(dp, T_plan), success_stress=success_rate(dp, len(needs_stress)),
+                 worst_plan=success_rate(dp[worst], T_plan), worst_stress=success_rate(dp[worst], len(needs_stress)))
 
     early = early_retire_scan(cfg, mu, cov, w_acc, w_ret, a0, r_acc, r_ret, plan_end, stress_end, z)
     first = lambda ok: next((x["age"] for x in early if ok(x)), None)
@@ -390,6 +472,12 @@ def run(cfg):
             "first_year_need": float(needs_plan[0]) if T_plan else 0.0,
             "crossover_age": cross_age,
         },
+        "four_percent_rule": {"target": fpr["target"], "annual_gap": fpr["annual_gap"], "bridge": fpr["bridge"],
+                              "reached_at_retirement": projected + fpr["lumps"] >= fpr["target"],
+                              "reach_age": fpr["reach_age"], "reach_target": fpr["reach_target"]},
+        "liability_matching": {f"{x['years']}y": x["lmp"] for x in lmp["rows"]},
+        "two_pool_mc": [{"strategy": "rebalance" if x["years"] is None else f"two_pool_{x['years']}y",
+                         "success_plan": x["success_plan"], "success_to_95": x["success_stress"]} for x in pool_rows],
         "early_retirement": {"earliest_deterministic": early_ages["deterministic"],
                              "earliest_mc_plan": early_ages["mc_plan"],
                              "earliest_mc_stress": early_ages["mc_stress"]},
@@ -415,6 +503,7 @@ def run(cfg):
                              "need": float(n), "df": (1 + r_ret) ** t, "pv": float(n) / (1 + r_ret) ** t}
                             for t, n in enumerate(needs_plan)],
             "acc_rows": acc_rows, "fv_factor": fv_factor, "cross_rows": cross, "early_rows": early,
+            "four_pct": fpr, "lmp": lmp, "pool_rows": pool_rows,
             "draw_rows": drawdown_rows(projected, needs_stress, r_ret, ra),
             "mc_pcts": [{"age": age + k, "P10": float(p[0]), "P50": float(p[1]), "P90": float(p[2])}
                         for k, p in enumerate(mc_pcts)],
@@ -599,7 +688,7 @@ def calc_sections(cfg, res):
     L += [f"| **合計** | | | " + "| " * len(cols) + f"{fmt(sum(x['need'] for x in rows))} | | **{fmt(c['target_raw'])}** |", ""]
     if c["target_raw"] < 0:
         L += [f"- 現值合計為負，代表固定收入與一次領已足夠支應，目標取 max(0, 合計) = **0**", ""]
-    # 年生活費拆成「固定收入」與「投資組合提領」：兩組長條重疊繪製，整根 = 年生活費，下段 = 固定收入，上段 = 缺口
+    # 年生活費 vs 固定收入：xychart-beta 的兩組長條是左右並排（不支援堆疊），兩柱相減 = 須由投資組合提領的缺口
     fixed = [min(x["expense"], sum(x["parts"].values())) for x in rows]
     segs = []  # 固定收入相同的連續年齡合併成一段
     for x, f in zip(rows, fixed):
@@ -607,9 +696,9 @@ def calc_sections(cfg, res):
             segs[-1][1] = x["age"]
         else:
             segs.append([x["age"], x["age"], f, x["expense"]])
-    L += ["年生活費由誰支付：整根長條 = 年生活費，底部藍色 = **勞保、勞退等固定收入**，"
-          "上方橘色 = **缺口，須由投資組合提領**：", "",
-          *chart("年生活費 = 固定收入（下段）+ 投資組合提領（上段）（萬元）", [x["age"] for x in rows],
+    L += ["年生活費由誰支付：每個年齡兩根長條並排，**橘柱 = 年生活費**，**藍柱 = 勞保、勞退等固定收入**；"
+          "橘柱比藍柱高出的部分，就是**須由投資組合提領的缺口**：", "",
+          *chart("年生活費（橘柱）vs 固定收入（藍柱）（萬元）", [x["age"] for x in rows],
                  [("bar", [x["expense"] for x in rows]), ("bar", fixed)], palette=["#F28E2B", "#4E79A7"]),
           "| 年齡 | 年生活費 | 固定收入 | 投資組合提領（缺口） | 缺口佔生活費 |", "|---|--:|--:|--:|--:|"]
     L += [f"| {a}{'' if a == b else f'～{b}'} | {fmt(ex)} | {fmt(f)} | {fmt(ex - f)} | {pc((ex - f) / ex if ex else 0)} |"
@@ -619,7 +708,7 @@ def calc_sections(cfg, res):
         L += ["", f"- 一次領合計 {fmt(lump_total)} 元在請領當年存入投資組合，不算固定收入；"
               f"它可支付約 {lump_total / max(1.0, segs[0][3] - segs[0][2]):.1f} 年的退休初期缺口"]
     L += ["", "每年須由投資組合提領 $C_t$（長條，已扣除一次領存入）與其折現值（折線）：", "",
-          *chart("每年提領 C_t 與現值（萬元）", [x["age"] for x in rows],
+          *chart("每年提領 C_t（藍柱）與現值（橘線）（萬元）", [x["age"] for x in rows],
                  [("bar", [x["need"] for x in rows]), ("line", [x["pv"] for x in rows])]),
           f"- 不計勞保、勞退等固定收入時，每年都要提領 {fmt(12 * cfg['monthly_expense'])}，"
           f"目標為 {fmt(d['target_without_pension'])} 元", ""]
@@ -653,7 +742,7 @@ def calc_sections(cfg, res):
           f"，算到 {e['stress_end_age']} 歲", "",
           "| 年齡 | 年初資產 | 提領 $C_t$（負數為存入） | 報酬 | 年末資產 |", "|--:|--:|--:|--:|--:|"]
     L += [f"| {x['age']} | {fmt(x['start'])} | {fmt(x['withdraw'])} | {fmt(x['growth'])} | {fmt(x['end'])} |" for x in dr]
-    if lp and lp["mode"] == "monthly" and e["stress_end_age"] > end:
+    if lp and lp["mode"] == "monthly" and e["stress_end_age"] > end and not (d["depletion_age"] and d["depletion_age"] <= end):
         L += ["", f"- {end} 歲起勞退已在規劃期內攤完、不再計入，提領金額因此改變"]
     L += ["", *chart("退休後年初資產（萬元）", [x["age"] for x in dr], [("line", [x["start"] for x in dr])]),
           "- " + (f"{d['depletion_age']} 歲資產耗盡" if d["depletion_age"] else f"{e['stress_end_age']} 歲前不會耗盡"), ""]
@@ -732,7 +821,8 @@ def crossover_section(cfg, res):
     exp_m = cfg["monthly_expense"]
     early = {x["age"]: x for x in res["_calc"]["early_rows"]}
     shown = [x for x in rows if x["age"] <= (min(ca + 3, e["stress_end_age"]) if ca else e["stress_end_age"])]
-    in_plan = [x for x in shown if x["age"] in early]  # 圖表只畫到規劃終點前一年（之後沒有「可花到規劃終點」的值）
+    # 綠線另畫一張、只到原退休年齡 +10 歲：越接近規劃終點，綠線的分母年數越少而暴衝，會把 Y 軸撐大、看不清交叉點
+    in_plan = [x for x in rows if x["age"] in early and x["age"] <= ra + 10]
     by_age = {x["age"]: x for x in rows}
     L = ["## 跨越點（財務自由門檻）與提早退休", "",
          "跨越點法則（Crossover Point）：**每月的被動收入 ≥ 每月生活支出**，"
@@ -745,13 +835,18 @@ def crossover_section(cfg, res):
          f"- 生活支出 = 退休後每月生活費 {fmt(exp_m)} 元（今天的物價）",
          f"- **綠線（該年齡退休每月可花）**：如果在這個年齡退休、停止投入，退休後每月最多能花多少，"
          f"才能剛好花到規劃終點 {e['plan_end_age']} 歲（會動用本金；確定性計算）。"
-         "綠線越過橘線的年齡，就是最早可以退休的年齡（見下方「什麼時候可以提早退休」）", "",
-         *chart("跨越點與提早退休：被動收入（藍柱）、生活費（橘線）、該年齡退休每月可花（綠線）（萬元／月）",
-                [x["age"] for x in in_plan],
-                [("bar", [(x["invest"] + x["fixed"]) / 12 for x in in_plan]),
-                 ("line", [x["expense"] / 12 for x in in_plan]),
-                 ("line", [early[x["age"]]["max_monthly"] for x in in_plan])],
+         "綠線越過橘線的年齡，就是最早可以退休的年齡（見下方「什麼時候可以提早退休」）",
+         f"- 綠線另畫一張、只到 {ra + 10} 歲（預計退休 +10 歲）：再往後離規劃終點太近，綠線會因剩餘年數太少而暴衝", "",
+         *chart("跨越點：被動收入（藍柱）、生活費（橘線）（萬元／月）",
+                [x["age"] for x in rows],
+                [("bar", [(x["invest"] + x["fixed"]) / 12 for x in rows]),
+                 ("line", [x["expense"] / 12 for x in rows])],
                 unit="萬元／月"),
+         *chart("提早退休：生活費（橘線）、該年齡退休每月可花（綠線）（萬元／月）",
+                [x["age"] for x in in_plan],
+                [("line", [x["expense"] / 12 for x in in_plan]),
+                 ("line", [early[x["age"]]["max_monthly"] for x in in_plan])],
+                unit="萬元／月", palette=CHART_PALETTE[1:]),
          "| 年齡 | 年初投資資產 | 每月投資收益 | 每月固定收入 | 每月被動收入合計 | 佔生活費 |", "|--:|--:|--:|--:|--:|--:|"]
     for x in shown:
         if (x["age"] - e["age"]) % 5 == 0 or x["age"] in (ra, ca, shown[-1]["age"]):
@@ -806,6 +901,99 @@ def early_retire_section(cfg, res):
     return L
 
 
+def four_pct_section(cfg, res):
+    """「財務目標門檻：25 倍法則」與「達標後的資產重組：負債配合 vs 風險組合」。"""
+    e = res["inputs_echo"]
+    f, lm = res["_calc"]["four_pct"], res["_calc"]["lmp"]
+    ra, tgt = e["retire_age"], res["deterministic"]["target"]
+    have = f["projected"] + f["lumps"]
+    cls = {a["symbol"]: a.get("asset_class", "") for a in cfg["assets"]}
+    risky_txt = "、".join(f"{a['symbol']} {pc(a['weight_retire'])}" for a in res["returns"]["assets"]
+                          if a["weight_retire"] > 0)
+    has_cash = any(asset_group(c) == "現金" for c in cls.values())
+    L = ["## 財務目標門檻：25 倍法則（4% 法則）", "",
+         "威廉．班根（William Bengen）的 4% 法則：退休第一年提領資產的 4%，之後每年依通膨調整，"
+         "歷史上能撐過 30 年。反過來說，**可投資資產達到「每年要自己負擔的生活費」的 25 倍**，就達到財務退休的基礎門檻。"
+         "有勞保、勞退等固定年金時，只需準備扣掉固定收入後的缺口（年超額支出）：", "",
+         "$$\\text{目標退休資產} = 25 \\times (\\text{預期年生活費} - \\text{年固定年金收入})$$", "",
+         f"- 預期年生活費 = {fmt(f['annual_expense'])} 元",
+         f"- 年固定年金收入 = {fmt(f['fixed_income'])} 元（{f['full_income_age']} 歲起所有月領收入都開始請領後）",
+         f"- 年超額支出 = {fmt(f['annual_expense'])} − {fmt(f['fixed_income'])} = **{fmt(f['annual_gap'])} 元**",
+         f"- 25 倍 = 25 × {fmt(f['annual_gap'])} = {fmt(f['base'])} 元"]
+    if f["bridge"] > 0:
+        L.append(f"- 過渡期缺口：{ra}～{f['full_income_age'] - 1} 歲固定收入還沒全部開始領，這幾年多出的缺口合計 "
+                 f"{fmt(f['bridge'])} 元，另外準備（實質、不折現）")
+    L += [f"- **目標退休資產 = {fmt(f['target'])} 元**", "",
+          "| 比較 | 金額 |", "|---|--:|",
+          f"| 25 倍法則門檻 | {fmt(f['target'])} |",
+          f"| 本試算的退休金目標（年金現值，花到 {e['plan_end_age']} 歲） | {fmt(tgt)} |",
+          f"| {ra} 歲退休時預估資產" + ("（含一次領）" if f["lumps"] else "") + f" | {fmt(have)} |", "",
+          ("- 照目前存法，" + f"{ra} 歲退休時**已達** 25 倍門檻" if have >= f["target"]
+           else f"- 照目前存法，{ra} 歲退休時**尚未達到** 25 倍門檻，還差 {fmt(f['target'] - have)} 元"),
+          "- 假設持續工作、每月投入（勞保、勞退依原規劃）：" + (f"**{f['reach_age']} 歲**投資資產第一次達到「該年齡退休」的門檻 {fmt(f['reach_target'])} 元"
+                                       f"（門檻隨退休年齡變動：越晚退休，過渡期缺口越小；上面的 {fmt(f['target'])} 元是 {ra} 歲退休的門檻）" if f["reach_age"]
+                                       else f"到 {e['plan_end_age']} 歲前都達不到門檻"),
+          "- 4% 法則以美國股債 30 年的歷史回測為基礎；退休期超過 30 年（提早退休）或預期報酬偏低時，"
+          "25 倍可能不夠，可改用 28～33 倍（3%～3.5% 提領率）。本試算的退休金目標用的是前瞻預期報酬與你的規劃期，兩者可互相對照",
+          "- 固定收入若有終止年齡（例如租金只收到某歲），之後的缺口會變大，25 倍會低估", "",
+          "## 達標後：資產重組（負債配合 vs 風險組合）", "",
+          "達到目標後，重點從「快速累積財富」轉為「防止資產歸零、安心享受生活」（伯恩斯坦《投資金律》、"
+          "馬朱利《持續買進》）。第一步是把資產分成兩個池子：", "",
+          "1. **負債配合投資組合（Liability-Matching Portfolio）**：把未來 5～10 年（保守一點 20～25 年）"
+          "要從投資組合提領的生活費缺口，鎖在極安全的資產：短期國庫券、抗通膨公債（TIPS）階梯、優質定存。"
+          "唯一目標是不論股市怎麼跌，這幾年的生活費都 100% 有著落",
+          "2. **風險性投資組合（Risk Portfolio）**：剩下的錢用來對抗長期通膨、"
+          "支應額外享受，或留給繼承人與慈善", "",
+          "兩個池子**各自獨立**：",
+          "- 安全池只放定存／現金" + ("（以台灣一年期定存利率計算）" if has_cash else "（沒有現金標的，假設實質報酬 0）")
+          + "，不參與風險池的再平衡",
+          f"- 風險池**照你的退休配置**持有並每年再平衡：{risky_txt}", "",
+          f"以 {ra} 歲退休時預估資產 {fmt(f['projected'])} 元計算（安全池金額 = 前 N 年每年須自行負擔的缺口加總，"
+          "已扣勞保、勞退等月領收入，實質、不折現）：", "",
+          "| 安全池涵蓋 | 負債配合組合（定存／現金） | 佔資產 | 風險組合（照退休配置） |", "|--:|--:|--:|--:|"]
+    for x in lm["rows"]:
+        risk = fmt(x["risk"]) if x["risk"] >= 0 else f"不足 {fmt(-x['risk'])}"
+        L.append(f"| {x['years']} 年 | {fmt(x['lmp'])} | {pc(x['share'])} | {risk} |")
+    L += ["", *chart("退休時資產（橘柱）vs 安全池所需金額（藍柱）（萬元）", [f'"{x["years"]} 年"' for x in lm["rows"]],
+                     [("bar", [f["projected"]] * len(lm["rows"])), ("bar", [x["lmp"] for x in lm["rows"]])],
+                     palette=["#F28E2B", "#4E79A7"]),
+          "每組兩根長條並排：**橘柱 = 退休時資產**，**藍柱 = 安全池（負債配合組合）所需金額**；"
+          "橘柱比藍柱高出的部分就是風險組合，藍柱高過橘柱代表退休時資產不夠鎖這麼多年", "",
+          "- 安全池用掉的部分，在風險組合表現好的年份由風險組合賣出補足；風險組合下跌時不賣，只動用安全池",
+          "- 勞保、勞退一次領的金額可在請領當年直接補進安全池", ""]
+    e2, pr = res["inputs_echo"], res["_calc"]["pool_rows"]
+    end, stress = e2["plan_end_age"], e2["stress_end_age"]
+    L += ["### 蒙地卡羅：兩個池子分開運作", "",
+          "用與「蒙地卡羅模擬」同一組市場走勢，比較兩種退休後的提領方式：", "",
+          "- **每年再平衡**（本試算主要結果）：每年先提領，再把整個組合調回退休配置的比例",
+          "- **兩池分開運作**：退休時把前 N 年的提領缺口放獨立的安全池（定存／現金），其餘放風險池，風險池照退休配置每年再平衡。"
+          "生活費一律從安全池付；**前一年風險池上漲**才賣風險池把安全池補到「未來 N 年的缺口」，"
+          "**下跌的年份不賣**；安全池用完才被迫賣風險池", "",
+          f"「最差 25%」＝退休後前 5 年報酬最差的四分之一路徑（報酬順序風險最大的情境）：", "",
+          f"| 提領方式 | 退休時安全池比例 | 退休時股票比例 | 撐到 {end} 歲 | 撐到 {stress} 歲 | 最差 25%：撐到 {end} 歲 | 最差 25%：撐到 {stress} 歲 |",
+          "|---|--:|--:|--:|--:|--:|--:|"]
+    for x in pr:
+        name = "每年再平衡（退休配置）" if x["years"] is None else f"兩池：安全池 {x['years']} 年"
+        si = "—" if x["safe_init"] is None else pc(x["safe_init"])
+        L.append(f"| {name} | {si} | {pc(x['stock_init'])} | {pc(x['success_plan'])} | {pc(x['success_stress'])} | "
+                 f"{pc(x['worst_plan'])} | {pc(x['worst_stress'])} |")
+    best = max(pr[1:], key=lambda x: (x["success_stress"], x["success_plan"]))
+    base = pr[0]
+    wins = [x["years"] for x in pr[1:] if x["worst_stress"] > base["worst_stress"]]
+    L += ["",
+          f"- 兩池方式中，撐到 {stress} 歲成功率最高的是**安全池 {best['years']} 年**（{pc(best['success_stress'])}），"
+          f"每年再平衡為 {pc(base['success_stress'])}："
+          + ("兩池方式較好" if best["success_stress"] > base["success_stress"] else "每年再平衡較好"),
+          "- 最差 25% 的情境下，" + (f"安全池 {'、'.join(map(str, wins))} 年比每年再平衡撐得久" if wins
+                                    else "兩池方式都沒有比每年再平衡撐得久"),
+          "- 為什麼兩池不一定比較好：每年再平衡在股市大跌後也會賣債券、買股票，本身就避免了低價賣股；"
+          "而兩池方式的安全池放定存，報酬通常比債券低，且逐年用掉、只在上漲年補回",
+          "- 兩者的股票比例不同：兩池方式退休時的股票比例 = （1 − 安全池比例）× 退休配置的股票比例；"
+          "比較時請同時看「退休時安全池比例」「退休時股票比例」兩欄",
+          "- 兩池方式的主要價值在心理面：知道未來幾年的生活費已經有著落，大跌時比較不會恐慌賣股", ""]
+    return L
+
+
 def mc_section(res):
     """報告中「蒙地卡羅模擬」：結果數據與白話解讀。"""
     e, d, m = res["inputs_echo"], res["deterministic"], res["monte_carlo"]
@@ -841,8 +1029,8 @@ def mc_section(res):
          "### 這個模擬在做什麼", "",
          f"- 用電腦隨機產生 **{m['paths']:,} 種**未來的市場走勢，可以想成 {m['paths']:,} 個平行人生，"
          "每個人生從現在一路走到 " + f"{stress} 歲",
-         "- 每一年各資產的報酬隨機抽樣（多變量常態分布），抽樣時保留資產之間的連動（相關係數），"
-         "例如美股大跌的年份，國際股通常也會一起跌",
+         "- 每一年各資產的報酬隨機抽樣（對數報酬為多變量常態分布，即報酬為對數常態），抽樣時保留資產之間的連動（相關係數），"
+         "例如股市大跌的年份，你持有的各檔股票通常會一起跌",
          f"- 每年再平衡：退休前維持目前配置，{ra} 歲起改用退休配置；退休後每年初先提領生活費，剩下的繼續投資",
          "- **成功**＝規劃期內每年的生活費都付得出；資產在那之前歸零就算失敗",
          "- **P10／P50／P90**：把所有路徑由小排到大，P10 是第 10%（運氣差）、P50 是中間（一般）、P90 是第 90%（運氣好）", "",
@@ -898,10 +1086,11 @@ def mc_section(res):
     else:
         L += [f"- 算到 {stress} 歲，所有路徑都沒有把錢用完", ""]
     L += ["### 6. 各年初資產分布", "",
-          f"三條線由下而上為 P10、P50、P90；{ra} 歲起每年初先提領再投資。P10 線碰到 0，代表運氣差的 10% 在那個年齡已經沒錢：", "",
-          *chart("蒙地卡羅：各年初資產百分位（萬元）", [x["age"] for x in mp],
+          f"**藍線 = P10（運氣差的 10%）**、**橘線 = P50（中位數）**、**綠線 = P90（運氣好的 10%）**；"
+          f"{ra} 歲起每年初先提領再投資。藍線碰到 0，代表運氣差的 10% 在那個年齡已經沒錢：", "",
+          *chart("蒙地卡羅：各年初資產（藍線 P10、橘線 P50、綠線 P90）（萬元）", [x["age"] for x in mp],
                  [("line", [x[p] for x in mp]) for p in ("P10", "P50", "P90")]),
-          "- 限制：報酬假設為常態分布，真實市場的極端事件（肥尾）可能更常發生，實際風險可能比模擬略高", ""]
+          "- 限制：報酬假設為對數常態分布，真實市場的極端事件（肥尾）可能更常發生，實際風險可能比模擬略高", ""]
     return L
 
 
@@ -937,6 +1126,13 @@ def report(cfg, res):
          f"- **錢大約幾歲用完**（理想情況）：" + (f"{d['depletion_age']} 歲" if d["depletion_age"] else f"活到 {e['stress_end_age']} 歲都還有剩"),
          "- **跨越點（被動收入 ≥ 生活費）**：" + (f"{d['crossover_age']} 歲（假設一直工作、持續投入到那時）" if d["crossover_age"]
                                             else f"{e['stress_end_age']} 歲前不會跨越") + "，詳見「跨越點（財務自由門檻）與提早退休」一節",
+         f"- **25 倍法則（4% 法則）門檻**：{e['retire_age']} 歲退休需 {fmt(res['four_percent_rule']['target'])} 元，"
+         + (f"{e['retire_age']} 歲退休時已達標" if res["four_percent_rule"]["reached_at_retirement"]
+            else (f"照目前存法要工作到 {res['four_percent_rule']['reach_age']} 歲才達標"
+                  f"（{res['four_percent_rule']['reach_age']} 歲退休的門檻是 {fmt(res['four_percent_rule']['reach_target'])} 元，"
+                  "越晚退休、勞保等固定收入請領前的過渡期越短，門檻越低）" if res["four_percent_rule"]["reach_age"]
+                  else "規劃期內達不到"))
+         + "；達標後的負債配合／風險組合分法見「達標後：資產重組」一節",
          "- **最早可以幾歲退休**（其他條件不變，退休後就不再存錢）：",
          *[f"  - {desc}：" + (f"**{a} 歲**就能退休" if a is not None else f"試算到 {early_last} 歲都還做不到")
            for desc, a in ((f"想有 {m['target_success'] * 100:.0f}% 的把握錢夠用到 {e['plan_end_age']} 歲",
@@ -958,12 +1154,14 @@ def report(cfg, res):
         c = cls[a["symbol"]]
         L.append(f"| {a['symbol']} | {c.get('asset_class', '')} | {fmt(c.get('value', 0))} | {pc(a['weight_now'])} | "
                  f"{pc(a['weight_retire'])} | {pc(a['real_geometric'])} | {pc(a['vol'])} |")
-    L += [""] + portfolio_section(cfg, res) + crossover_section(cfg, res) + calc_sections(cfg, res) + mc_section(res)
+    L += [""] + portfolio_section(cfg, res) + crossover_section(cfg, res) + four_pct_section(cfg, res) \
+        + calc_sections(cfg, res) + mc_section(res)
     L += ["## 資料來源", "", "| 項目 | 數值 | 來源 |", "|---|---|---|"]
     for s in cfg.get("sources", []):
         L.append(f"| {s['item']} | {s['value']} | {s['source']} |")
     L += ["", "## 假設與限制", ""] + [f"- {n}" for n in cfg.get("notes", [])] + [
-        "- 未計所得稅與基金內扣費用（美國掛牌股票 ETF 已依殖利率扣除 30% 股利預扣稅拖累，見各資產實質報酬表的 drag 欄）",
+        "- 未計所得稅與基金內扣費用" + ("（美國掛牌股票 ETF 已依殖利率扣除 30% 股利預扣稅拖累，見各資產實質報酬表的 drag 欄）"
+                                     if any(x.get("drag", 0) > 0 for x in cfg["assets"]) else ""),
         "- 股票預期報酬用高登方程式，假設估值維持現狀；若未來估值下修（負的投機報酬），實際報酬會更低",
         "- 未計匯率風險：海外資產以新台幣計價，視同本地資產",
         "- 報酬分布假設為對數常態，真實市場的極端事件（肥尾）可能更常發生", ""]
