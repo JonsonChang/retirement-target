@@ -138,7 +138,8 @@ def income_by_age(cfg, plan_end_age):
         if a < ra:
             raise ValueError(f"{name}一次領的請領年齡 {a} 早於退休年齡 {ra}")
         lumps[a] = lumps.get(a, 0.0) + amount
-        lump_parts[name] = {a: amount}
+        p = lump_parts.setdefault(name, {})
+        p[a] = p.get(a, 0.0) + amount
 
     li = cfg.get("labor_insurance")
     if li:
@@ -161,8 +162,15 @@ def income_by_age(cfg, plan_end_age):
             detail["labor_pension"] = {"mode": "monthly", "claim_age": x["claim_age"],
                                        "balance_at_claim": x["balance_at_claim"], "monthly": x["annual"] / 12}
         calc["labor_pension"] = x
-    for o in cfg.get("other_income", []):
-        add(o.get("name", "其他收入"), o["start_age"], o["annual"], o.get("end_age"))
+    for i, o in enumerate(cfg.get("other_income", [])):
+        name = o.get("name", "其他收入")
+        if o.get("lump"):
+            # 一次性收入：當年存入投資組合；退休前領到的延到退休當年才存入（不計中間的報酬）
+            a = max(o["age"], ra)
+            add_lump(f"{name}一次領", a, o["amount"])
+            detail[f"other_lump_{i}"] = {"mode": "lump_sum", "name": name, "claim_age": a, "lump": o["amount"]}
+        else:
+            add(name, o["start_age"], o["annual"], o.get("end_age"))
     return inc, lumps, detail, parts, lump_parts, calc
 
 
@@ -809,7 +817,7 @@ def portfolio_section(cfg, res):
     lumps = [(k, v) for k, v in res["income"].items() if v.get("mode") == "lump_sum"]
     names = {"labor_insurance": "勞保", "labor_pension": "勞退"}
     for k, v in lumps:
-        L.append(f"- **{names[k]}一次領**：{v['claim_age']} 歲領到 {fmt(v['lump'])} 元，當年存入投資組合，同樣依退休配置投資")
+        L.append(f"- **{v.get('name') or names[k]}一次領**：{v['claim_age']} 歲領到 {fmt(v['lump'])} 元，當年存入投資組合，同樣依退休配置投資")
     L.append("")
     return L
 

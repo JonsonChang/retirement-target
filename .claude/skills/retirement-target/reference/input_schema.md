@@ -33,7 +33,8 @@
 
   "labor_insurance": {"avg_insured_salary": 45800, "years": 35, "claim_age": 65, "legal_age": 65, "mode": "monthly", "pre2009_years": true},
   "labor_pension": {"balance": 800000, "monthly_wage": 70000, "rate": 0.06, "return_nominal": 0.03, "claim_age": 60, "mode": "monthly"},
-  "other_income": [{"name": "房租", "annual": 120000, "start_age": 60, "end_age": 80}],
+  "other_income": [{"name": "房租", "annual": 120000, "start_age": 60, "end_age": 80},
+                   {"name": "保單領回", "lump": true, "age": 65, "amount": 1000000}],
 
   "mc": {"paths": 10000, "seed": 42, "target_success": 0.85},
 
@@ -67,5 +68,6 @@
 | `labor_insurance.pre2009_years` |  | 98 年前是否有勞保年資；年資滿 15 年要選 `lump_sum` 時必須為 `true` |
 | `labor_pension` |  | 勞退個人專戶；請領年齡至少 60 且不早於退休 |
 | `labor_pension.mode` |  | `monthly`（預設，在規劃期內攤成月領）或 `lump_sum`（請領年齡當年把專戶餘額全數存入投資組合） |
-| `other_income[]` |  | 實質年額；`end_age` 不含，省略表示終身 |
+| `other_income[]` |  | 每年的固定收入：`annual` 為實質年額，`start_age` 起、`end_age` 不含，省略表示終身 |
+| `other_income[].lump` |  | `true` 表示一次性收入（保單領回、資產出售等）：`age` 當年把 `amount`（實質）存入投資組合，不算成每年的固定收入；`age` 早於退休時延到退休當年存入（不計中間的報酬） |
 | `sources[]`、`notes[]` |  | 原樣寫進報告 |

@@ -174,6 +174,25 @@ def test_four_pct_rule_with_bridge():
     assert f["target"] == pytest.approx(25 * (12 * 50000 - li_year) + 5 * li_year)
 
 
+def test_other_income_lump():
+    # 一次性收入（例如保單領回）在當年存入投資組合，不算成每年的固定收入
+    lump = {"name": "保單", "lump": True, "age": 61, "amount": 300000}
+    cfg = base_cfg(inflation=0.0, assets=[{"symbol": "A", "value": 1_000_000, "expected_return": 0.0, "vol": 0.0}],
+                   other_income=[lump])
+    res = calc.run(cfg)
+    assert res["deterministic"]["target"] == pytest.approx(10 * 12 * 50000 - 300000)
+    f = res["four_percent_rule"]
+    assert f["annual_gap"] == pytest.approx(12 * 50000) and f["target"] == pytest.approx(25 * 12 * 50000)
+    assert "保單一次領" in calc.report(cfg, res)
+
+
+def test_other_income_lump_before_retirement_deferred():
+    # 退休前領到的一次性收入，延到退休當年才存入（不計中間的報酬，保守）
+    cfg = base_cfg(inflation=0.0, assets=[{"symbol": "A", "value": 1_000_000, "expected_return": 0.0, "vol": 0.0}],
+                   other_income=[{"name": "保單", "lump": True, "age": 55, "amount": 300000}])
+    assert calc.run(cfg)["deterministic"]["target"] == pytest.approx(10 * 12 * 50000 - 300000)
+
+
 def test_liability_matching():
     cfg = base_cfg(
         assets=[{"symbol": "EQ", "asset_class": "us_large_cap", "value": 1_000_000, "expected_return": 0.07, "vol": 0.18},
@@ -237,4 +256,16 @@ def test_two_pool_target_ignores_lump():
     assert calc.simulate_two_pool(mu, cov, w_ret, w_safe, np.array([400.0]), needs, z, 2, gap)[0] == -1
     # 舊算法（目標用扣掉一次領的 needs，只有 150）→ 第 3 年耗盡
     assert calc.simulate_two_pool(mu, cov, w_ret, w_safe, np.array([400.0]), needs, z, 2)[0] == 2
+
+
+def test_two_pool_safe_init_matches_liability_matching_with_lump():
+    cfg = base_cfg(
+        assets=[{"symbol": "EQ", "asset_class": "us_large_cap", "value": 1_000_000, "expected_return": 0.07, "vol": 0.18},
+                {"symbol": "CASH", "asset_class": "tw_cash", "value": 0, "expected_return": 0.017, "vol": 0.005}],
+        other_income=[{"name": "保單", "lump": True, "age": 60, "amount": 3_000_000}])
+    res = calc.run(cfg)
+    pr = {x["years"]: x["safe_init"] for x in res["_calc"]["pool_rows"]}
+    A = res["deterministic"]["projected_at_retirement"]
+    assert pr[5] == pytest.approx(min(1.0, 5 * 12 * 50000 / A))
+
 
