@@ -3,6 +3,7 @@
 # dependencies = ["numpy", "pytest"]
 # ///
 """執行：uv run --with numpy --with pytest pytest test_calc.py -q"""
+import json
 import math
 
 import numpy as np
@@ -138,12 +139,12 @@ def test_mc_analysis_consistent():
     assert surv[e["plan_end_age"]] == pytest.approx(m["success_plan"])
     assert surv[e["stress_end_age"]] == pytest.approx(m["success_to_95"])
     assert len(a["seq"]) == 4 and a["seq"][0]["success_stress"] <= a["seq"][-1]["success_stress"]
-    assert "### 重點解讀" in calc.report(cfg, res)
+    assert "### 9.4 報酬順序風險" in calc.report(cfg, res)
 
 
 def test_mc_report_zero_vol():
     res = calc.run(base_cfg())
-    assert "## 蒙地卡羅模擬" in calc.report(base_cfg(), res)
+    assert "## 9. 蒙地卡羅模擬" in calc.report(base_cfg(), res)
 
 
 def test_report_retirement_portfolio():
@@ -152,9 +153,9 @@ def test_report_retirement_portfolio():
                 {"symbol": "BD", "asset_class": "us_aggregate_bond", "value": 0, "expected_return": 0.04, "vol": 0.06}],
         retirement_allocation={"EQ": 0.4, "BD": 0.6})
     rep = calc.report(cfg, calc.run(cfg))
-    assert "## 退休後的投資組合" in rep
+    assert "## 4. 退休時配置轉換" in rep
     assert "| 股票 | 100.0% | 40.0% |" in rep and "| 債券 | 0.0% | 60.0% |" in rep
-    assert "為什麼退休要換配置" in rep
+    assert "| EQ | 美國大型股 | 股票 | 100.0% |" in rep
 
 
 def test_four_pct_rule_without_income():
@@ -203,8 +204,8 @@ def test_liability_matching():
     assert lm["rows"][0]["lmp"] == pytest.approx(5 * 12 * 50000)
     assert lm["rows"][0]["risk"] == pytest.approx(A - 5 * 12 * 50000)
     rep = calc.report(cfg, res)
-    assert "25 倍法則（4% 法則）" in rep and "負債配合投資組合" in rep
-    assert "風險池**照你的退休配置**持有並每年再平衡：EQ 40.0%、BD 60.0%" in rep
+    assert "### 8.1 25 倍法則（4% 法則" in rep and "### 8.2 安全池（負債配合組合）與風險池" in rep
+    assert "風險池照退休配置持有並每年再平衡：EQ 40.0%、BD 60.0%" in rep
 
 
 def test_two_pool_zero_return():
@@ -239,10 +240,47 @@ def test_two_pool_in_report():
     tp = res["two_pool_mc"]
     assert tp[0]["strategy"] == "rebalance" and len(tp) == 5
     assert tp[0]["success_plan"] == pytest.approx(res["monte_carlo"]["success_plan"])
-    assert "### 蒙地卡羅：兩個池子分開運作" in calc.report(cfg, res)
+    assert "### 8.3 蒙地卡羅：兩池分開運作 vs 每年再平衡" in calc.report(cfg, res)
     pr = res["_calc"]["pool_rows"]
     assert pr[0]["safe_init"] is None and pr[0]["stock_init"] == pytest.approx(0.4)
     assert pr[1]["stock_init"] == pytest.approx(0.4 * (1 - pr[1]["safe_init"]))
+
+
+def test_raw_report_sections_and_json():
+    li = {"avg_insured_salary": 45800, "years": 30, "claim_age": 65, "legal_age": 65}
+    cfg = base_cfg(labor_insurance=li, other_income=[{"name": "保單", "lump": True, "age": 60, "amount": 300000}])
+    res = calc.run(cfg)
+    rd = calc.derive(cfg, res)
+    rep = calc.report(cfg, res, rd)
+    heads = ["## 0. 關鍵數字總表", "## 1. 輸入與假設", "## 2. 達標標準總對照表", "## 3. 固定收入與一次領",
+             "## 4. 退休時配置轉換", "## 5. 各年齡退休試算", "## 6. 情境敏感度", "## 7. 跨越點",
+             "## 8. 25 倍法則與資產重組", "## 9. 蒙地卡羅模擬", "## 10. 計算過程", "## 11. 資料來源", "## 12. 假設與限制"]
+    assert [rep.index(h) for h in heads] == sorted(rep.index(h) for h in heads)
+    # 60 歲退休、勞保 65 歲才領：空窗期 5 年
+    assert rd["bridge"]["years"] == 5 and "空窗期：60～64 歲（5 年）" in rep
+    assert rd["lump_total"] == pytest.approx(300000)
+    assert rd["standards"][0]["need"] == pytest.approx(res["deterministic"]["target"])
+    names = [x["name"] for x in rd["sensitivity"]]
+    assert names[0] == "基準" and "每月投入歸零" in names and "58 歲退休（提早 2 年）" in names
+    assert rd["sensitivity"][0]["success_plan"] == pytest.approx(res["monte_carlo"]["success_plan"])
+    assert all(x["light"] in ("✅", "🟡", "⚠️", "❌") for x in rd["early"])
+    assert {"crossover", "survival", "need_pv"} <= set(rd["charts"])
+    out = json.loads(calc.to_json(cfg, res, rd))
+    assert out["summary"][0]["item"] == "規劃期" and out["charts"]["survival"]["series"][0]["type"] == "line"
+
+
+def test_gap_txt_and_light():
+    assert calc.gap_txt(100) == "➖ 不足 100" and calc.gap_txt(-100) == "➕ 餘裕 100"
+    assert [calc.light(x) for x in (0.9, 0.75, 0.5, 0.1)] == ["✅", "🟡", "⚠️", "❌"]
+
+
+def test_chart_long_age_axis_uses_range():
+    long = calc.chart("t", list(range(45, 96)), [("line", [1e4] * 51)])
+    assert '    x-axis "年齡" 45 --> 95' in long
+    short = calc.chart("t", [65, 66, 67], [("bar", [1e4] * 3)])
+    assert "    x-axis [65, 66, 67]" in short
+    label = calc.chart("t", ['"5 年"', '"10 年"'], [("bar", [1e4] * 2)])
+    assert '    x-axis ["5 年", "10 年"]' in label
 
 
 def test_two_pool_target_ignores_lump():
@@ -267,5 +305,3 @@ def test_two_pool_safe_init_matches_liability_matching_with_lump():
     pr = {x["years"]: x["safe_init"] for x in res["_calc"]["pool_rows"]}
     A = res["deterministic"]["projected_at_retirement"]
     assert pr[5] == pytest.approx(min(1.0, 5 * 12 * 50000 / A))
-
-
