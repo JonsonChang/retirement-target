@@ -11,6 +11,8 @@
 台股（純數字代號，可帶英文尾碼，如 00679B）：Fugle 還原權值月K → yfinance .TW → .TWO
 其他市場：yfinance（auto_adjust）→ Yahoo chart API
 Fugle 金鑰從環境變數 FUGLE_API_KEY 讀取，未設定時讀專案目錄下的 .env；都沒有就跳過 Fugle。
+快取：各標的的月收盤與殖利率存在 <專案>/.cache/retirement-target/market/，同一個月內重跑直接讀快取；
+匯率當天有效。加 --refresh 強制重抓。
 輸出 JSON 到 stdout，進度與錯誤訊息寫到 stderr。
 """
 import argparse
@@ -46,7 +48,27 @@ def _retry(fn, tries=3, wait=1.5):
 
 
 # 專案目錄 = scripts/ 往上四層（<專案>/.claude/skills/retirement-target/scripts）
-ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", ".env")
+PROJECT_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".."))
+ENV_FILE = os.path.join(PROJECT_DIR, ".env")
+CACHE_DIR = os.path.join(PROJECT_DIR, ".cache", "retirement-target", "market")
+
+
+def _cache_path(name):
+    return os.path.join(CACHE_DIR, re.sub(r"[^\w.-]", "_", name) + ".json")
+
+
+def cache_load(name):
+    try:
+        with open(_cache_path(name), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def cache_save(name, data):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(_cache_path(name), "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
 
 
 def load_env_file(path=ENV_FILE):
@@ -119,6 +141,12 @@ def monthly_from_yahoo_chart(ticker, years):
     return s[~s.index.duplicated(keep="last")]
 
 
+def trim(s, years):
+    """只保留最近 years 年，並去掉當月（尚未收盤）。"""
+    cur = pd.Timestamp.today().to_period("M")
+    return s[(s.index < cur) & (s.index >= cur - 12 * years)]
+
+
 def fetch_one(symbol, years):
     if is_tw(symbol):
         sources = [("fugle", lambda: monthly_from_fugle(symbol, years)),
@@ -130,11 +158,7 @@ def fetch_one(symbol, years):
     errors = {}
     for name, fn in sources:
         try:
-            s = fn()
-            # 只保留最近 years 年，並去掉當月（尚未收盤）
-            cur = pd.Timestamp.today().to_period("M")
-            s = s[(s.index < cur) & (s.index >= cur - 12 * years)]
-            return name, s, errors
+            return name, trim(fn(), years), errors
         except Exception as e:
             errors[f"{name}#{len(errors)}"] = str(e)
             eprint(f"[{symbol}] {name} 失敗: {e}")
@@ -170,10 +194,17 @@ def div_yield(tickers):
     return None, 0
 
 
-def usd_twd():
+def usd_twd(refresh=False):
+    today = dt.date.today().isoformat()
+    c = None if refresh else cache_load("_USDTWD")
+    if c and c.get("date") == today:
+        return c["rate"]
     try:
         d = requests.get("https://open.er-api.com/v6/latest/USD", timeout=15).json()
-        return d["rates"]["TWD"] if d.get("result") == "success" else None
+        if d.get("result") != "success":
+            return None
+        cache_save("_USDTWD", {"date": today, "rate": d["rates"]["TWD"]})
+        return d["rates"]["TWD"]
     except Exception as e:
         eprint(f"匯率取得失敗: {e}")
         return None
@@ -186,17 +217,30 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("symbols", nargs="+")
     ap.add_argument("--years", type=int, default=10)
+    ap.add_argument("--refresh", action="store_true", help="忽略快取，全部重抓")
     args = ap.parse_args()
 
+    month = str(pd.Timestamp.today().to_period("M"))
     out = {"as_of": dt.date.today().isoformat(), "years_requested": args.years,
-           "usd_twd": usd_twd(), "assets": {}, "failed": {}}
+           "usd_twd": usd_twd(args.refresh), "cache_dir": CACHE_DIR, "assets": {}, "failed": {}}
     rets = {}
     for sym in args.symbols:
-        eprint(f"抓取 {sym} ...")
-        src, s, errors = fetch_one(sym, args.years)
-        if s is None:
-            out["failed"][sym] = errors
-            continue
+        c = None if args.refresh else cache_load(sym)
+        if c and c.get("month") == month and c.get("years", 0) >= args.years:
+            eprint(f"{sym} 使用快取（{month}）")
+            src, y, n, cached = c["source"], c["div_yield_ttm"], c["div_count_ttm"], True
+            s = trim(pd.Series(list(c["closes"].values()), index=pd.PeriodIndex(list(c["closes"]), freq="M")), args.years)
+        else:
+            eprint(f"抓取 {sym} ...")
+            src, s, errors = fetch_one(sym, args.years)
+            if s is None:
+                out["failed"][sym] = errors
+                continue
+            y, n = div_yield([f"{sym}.TW", f"{sym}.TWO"] if is_tw(sym) else [sym])
+            cached = False
+            cache_save(sym, {"month": month, "years": args.years, "source": src,
+                             "div_yield_ttm": y, "div_count_ttm": n,
+                             "closes": {str(k): float(v) for k, v in s.items()}})
         r = np.log(s).diff().dropna()
         rets[sym] = r
         out["assets"][sym] = {
@@ -207,9 +251,10 @@ def main():
             # 對數月報酬年化
             "vol_annual": float(r.std(ddof=1) * np.sqrt(12)),
             "hist_return_annual": float(np.exp(r.mean() * 12) - 1),
+            "div_yield_ttm": y,
+            "div_count_ttm": n,
+            "cached": cached,
         }
-        y, n = div_yield([f"{sym}.TW", f"{sym}.TWO"] if is_tw(sym) else [sym])
-        out["assets"][sym].update(div_yield_ttm=y, div_count_ttm=n)
 
     if rets:
         df = pd.DataFrame(rets)

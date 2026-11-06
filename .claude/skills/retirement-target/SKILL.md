@@ -38,6 +38,22 @@ description: 計算退休金目標、退休缺口與每月需再多存多少（�
 
 ## 步驟 2：自動取得資料
 
+**先查本機快取，沒有或過期才上網。** 快取放在專案目錄（`$SKILL` 往上三層）的 `.cache/retirement-target/`，已加入 `.gitignore`：
+- `market/`：`fetch_market.py` 自動管理，同一個月內重跑直接讀快取（當月未收盤的資料本來就不用）；匯率當天有效。使用者要求最新資料時加 `--refresh`
+- `web_lookups.json`：下面第 1、3～6 項 WebSearch 查到的數值。查之前先讀這個檔，找到對應的 key 且 `expires` 晚於今天就直接用（`sources` 照記原本的來源，數值後註明「本機快取，查詢日 YYYY-MM-DD」）；沒有或過期才 WebSearch，查到後寫回（同 key 覆蓋）。格式：
+  ```json
+  {"<key>": {"value": 0.021, "source": "來源網址或名稱", "fetched": "2026-11-06", "expires": "2027-02-01", "note": "選填"}}
+  ```
+  | key | 內容 | `expires` |
+  |---|---|---|
+  | `asset_class:<代號>` | 持股歸類（value 為 asset_class） | 不過期，填 `9999-12-31` |
+  | `sec_yield:<代號>` | 債券 ETF 的 30 日 SEC yield | 查詢日 + 1 個月 |
+  | `tw_deposit_1y` | 台灣一年期定存利率 | 查詢日 + 1 個月 |
+  | `ltcma` | J.P. Morgan LTCMA，value 為 `{asset_class: 報酬}`，`note` 記版本年 | 下一年 11 月 1 日 |
+  | `inflation_20y` | 主計總處 CPI 年增率近 20 年平均（未取 max 前） | 下一年 2 月 1 日 |
+  | `life_expectancy:<男/女>:<年齡>` | 簡易生命表平均餘命 | 下一年 9 月 1 日 |
+  | `labor_rules` | 勞保投保薪資上限、費率等今年規則，value 為物件 | 下一年 1 月 15 日 |
+
 1. **歸類**：把每個持股歸到 `defaults.md` 的 `asset_class`。不確定是什麼標的時用 WebSearch 查。
 2. **歷史波動率、相關係數與殖利率**：
    ```
